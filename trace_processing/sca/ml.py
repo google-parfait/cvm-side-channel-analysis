@@ -17,7 +17,7 @@
 import copy
 from typing import Any, Callable, Optional
 from absl import logging
-from farfetchd import data_analysis
+from sca import data_analysis
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression

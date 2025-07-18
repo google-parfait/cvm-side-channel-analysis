@@ -18,7 +18,7 @@ import multiprocessing
 from typing import Any, Callable, Iterator, Optional
 
 from absl import logging
-from farfetchd import feature_filters
+from sca import feature_filters
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split

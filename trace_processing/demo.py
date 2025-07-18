@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""A demo for running the farfetchd framework."""
+"""A demo for running the SCA framework."""
 from absl import app
 from absl import flags
-from farfetchd import data_analysis
-from farfetchd import feature_extraction
-from farfetchd import feature_filters
-from farfetchd import trace_processing
-from farfetchd import util
+from sca import data_analysis
+from sca import feature_extraction
+from sca import feature_filters
+from sca import trace_processing
+from sca import util
 FLAGS = flags.FLAGS
 flags.DEFINE_boolean(
     "parse_traces",
