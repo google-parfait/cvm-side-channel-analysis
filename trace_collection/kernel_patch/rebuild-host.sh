@@ -14,17 +14,17 @@
 # limitations under the License.
 
 
-SCRIPT_DIR="$(dirname $0)"
-. ${SCRIPT_DIR}/common.sh
-. ${SCRIPT_DIR}/stable-commits
-[ -e /etc/os-release ] && . /etc/os-release
+SCRIPT_DIR="$(dirname "$0")"
+. "${SCRIPT_DIR}"/common.sh
+. "${SCRIPT_DIR}"/stable-commits
+[[ -e /etc/os-release ]] && . /etc/os-release
 
 OUTPUT_DIR="snp-release-2024-08-27"
 
 build_host_kernel
 rm -rf $OUTPUT_DIR/linux/host/*
 
-if [ "$ID" = "debian" ] || [ "$ID_LIKE" = "debian" ]; then
+if [[ "$ID" = "debian" ]] || [[ "$ID_LIKE" = "debian" ]]; then
 	cp linux/linux-*-host-*.deb $OUTPUT_DIR/linux/host -v
 else
 	cp linux/kernel-*.rpm $OUTPUT_DIR/linux -v

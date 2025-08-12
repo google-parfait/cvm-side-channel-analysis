@@ -1,5 +1,10 @@
+# Collecting traces from the CVM
 
-### compile libtea
+Before proceeding to trace collection, the host kernel must be instrumented
+according to the instructions in `kernel_patch`.
+
+### Compile libtea
+
 ```bash
 git clone https://github.com/Jdkhnjggf/frameworks.git
 cd frameworks/libtea
@@ -8,18 +13,20 @@ make libtea-x86-interrupts
 sudo insmod module/libtea.ko
 ```
 
-### compile the userspace-controller
+### Compile the userspace-controller
+
 ```bash
 cp -r sca_dp ./
 cd sca_dp && make
 ```
 
-### env and runtime configuration
+### Configure the env and the runtime
+
 ```bash
 sudo ./env.sh
 
 
-> vim main.c
+> vim config.h
 
 #define CLEAN_CACHE     0  //  Set to 1 for Cachelines traces
 #define CACHE_ATTACKS   0  //  Set to 1 for Cachelines traces
@@ -31,11 +38,13 @@ sudo ./env.sh
 > make
 ```
 
-### Prepare Guest Environment
-Currently, the framework is looking for two different parts in traces. Please slightly change the test case as follows: 
+### Prepare the guest environment
 
-``` C
-#define REP4(X) X X X X
+The framework is collecting two stages for each traces. The test case needs to
+be instrumented as follows:
+
+```c
+#define REP8(X) X X X X
 int foo;
 
 /* A Page contains `clflush` to indicate START */
@@ -56,13 +65,25 @@ asm volatile(".align 4096\n");
 REP4(asm volatile("clflush 0(%0)\n\n"::"c"(&foo):"rax"););
 ```
 
-### Collect Data Trace
+### Collect a single trace
+
 ```bash
 hv> sudo ./sca_dp 0 0 1000000 0
-vm> <target> 
+vm> <target>
 
 # Output the trace from the log buffer
 hv> sudo cat /sys/kernel/debug/tracing/trace > <OUTPUT_FILE>
 # Clean the log buffer
 hv> sudo sh -c 'echo > /sys/kernel/debug/tracing/trace'
+```
+
+### Collect a batch of traces
+
+A helper script `collect_batch.sh` can be used to collect a batch of
+`<NUM_TRACES>` examples using a single `<VM_COMMAND>`. The examples are saved at
+`<OUTPUT_PATH>/<TRACE_LABEL>_[idx]`, where `idx` starts at `TRACE_START_IDX`.
+The CVM memory is reshuffled every `<SHUFFLE_MEMORY_AFTER>` traces.
+
+```bash
+collect_batch.sh <VM_COMMAND> <TRACE_START_IDX> <NUM_TRACES> <OUTPUT_PATH> <TRACE_LABEL> <SHUFFLE_MEMORY_AFTER>
 ```

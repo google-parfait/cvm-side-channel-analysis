@@ -14,7 +14,6 @@
 # limitations under the License.
 
 
-# Number of iterations to run
 VM_COMMAND=$1
 START=$2
 NUM_ITERATIONS=$3
@@ -22,7 +21,7 @@ OUTPUT_PATH=$4
 LABEL=$5
 SHUFFLE_MEMORY_AFTER=$6
 
-mkdir -p  $OUTPUT_PATH
+mkdir -p  "$OUTPUT_PATH"
 
 echo "Collecting ${NUM_ITERATIONS} traces starting at index ${START} via '${VM_COMMAND}' at ${OUTPUT_PATH}/${LABEL}_*"
 
@@ -48,7 +47,7 @@ for ((i = START; i < START+NUM_ITERATIONS; i++)); do
         sudo chmod 644 "${OUTPUT_PATH}/${LABEL}_${i}"
 
         echo "$((i+1)) traces collected"
-        if [ $(((i+1)%${SHUFFLE_MEMORY_AFTER})) -eq 0 ]; then
+        if [[ $(((i+1)%${SHUFFLE_MEMORY_AFTER})) -eq 0 ]]; then
                 sudo ./sca_dp 0 0 200000 1
 
 		ssh snp-vm 'echo 3 | sudo tee /proc/sys/vm/drop_caches' > /dev/null
